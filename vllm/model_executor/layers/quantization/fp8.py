@@ -17,6 +17,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     apply_fp8_marlin_linear, prepare_fp8_layer_for_marlin)
+from vllm.model_executor.layers.quantization.utils.fp8_utils_cpu import (
+    dequant_block_fp8_weight_naive)
+
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -28,6 +31,7 @@ from vllm.model_executor.parameter import (BlockQuantScaleParameter,
                                            PerTensorScaleParameter)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.model_executor.layers.activation import (SiluAndMul)
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -247,15 +251,16 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
-            if current_platform.is_rocm():
-                weight, weight_scale, _ = \
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        weight=layer.weight,
-                        weight_scale=layer.weight_scale_inv,
-                        input_scale=layer.input_scale)
-                layer.weight = Parameter(weight, requires_grad=False)
-                layer.weight_scale_inv = Parameter(weight_scale,
-                                                   requires_grad=False)
+            if current_platform.is_cpu():
+                from vllm.model_executor.layers.quantization.utils.fp8_utils_cpu import pad_block_fp8_weight_naive
+                layer.weight, orig_M, orig_N = pad_block_fp8_weight_naive(
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.quant_config.weight_block_size)
+                orig_M = torch.nn.Parameter(torch.tensor(orig_M, dtype=torch.int32), requires_grad=False)
+                orig_N = torch.nn.Parameter(torch.tensor(orig_N, dtype=torch.int32), requires_grad=False)
+                layer.register_parameter("orig_M", orig_M)
+                layer.register_parameter("orig_N", orig_N)
             return
         layer.weight = torch.nn.Parameter(layer.weight.data,
                                           requires_grad=False)
@@ -342,10 +347,25 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
                 bias=bias)
-
+        
+        if current_platform.is_cpu():
+            from vllm.model_executor.layers.quantization.utils.fp8_utils_cpu import (
+            apply_block_fp8_linear)
+            return apply_block_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                block_size=self.quant_config.weight_block_size,
+                weight_scale=layer.weight_scale_inv,
+                input_scale=layer.input_scale,
+                bias=bias,
+                original_M=layer.orig_M,
+                original_N=layer.orig_N,
+            )
+        
         # Note: lazy import to avoid triton import error.
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             apply_w8a8_block_fp8_linear)
+        
         if self.block_quant:
             assert self.quant_config.weight_block_size is not None
             return apply_w8a8_block_fp8_linear(
@@ -384,6 +404,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        self.act_fn = SiluAndMul()
 
     def create_weights(self, layer: Module, num_experts: int, hidden_size: int,
                        intermediate_size_per_partition: int,
@@ -533,7 +554,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if w2_input_scale is not None:
                     layer.w2_input_scale = torch.nn.Parameter(
                         w2_input_scale, requires_grad=False)
+            
+
+            if current_platform.is_cpu():
+                import intel_extension_for_pytorch as ipex
+                layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+                            layer.w13_weight,
+                            layer.w2_weight,
+                            use_prepack=True,
+                        )
             return
+
         # If checkpoint is fp16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
             # If rocm, use float8_e4m3fnuz as dtype
@@ -647,6 +678,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        
+        if current_platform.is_hpu():
+            return self.forward_hpu(x=x,
+                    layer=layer,
+                    router_logits=router_logits,
+                    top_k=top_k,
+                    renormalize=renormalize,
+                    use_grouped_topk=use_grouped_topk,
+                    topk_group=topk_group,
+                    num_expert_group=num_expert_group,
+                    custom_routing_function=custom_routing_function,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias)
+        
+        if current_platform.is_cpu():
+            return self.forward_cpu(x=x,
+                    layer=layer,
+                    router_logits=router_logits,
+                    top_k=top_k,
+                    renormalize=renormalize,
+                    use_grouped_topk=use_grouped_topk,
+                    topk_group=topk_group,
+                    num_expert_group=num_expert_group,
+                    custom_routing_function=custom_routing_function,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias)
+
         from vllm.model_executor.layers.fused_moe import fused_experts
 
         topk_weights, topk_ids = FusedMoE.select_experts(
@@ -678,6 +736,148 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
         )
+    
+    def forward_cpu( self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            use_grouped_topk: bool,
+            top_k: int,
+            router_logits: torch.Tensor,
+            renormalize: bool,
+            topk_group: Optional[int] = None,
+            num_expert_group: Optional[int] = None,
+            custom_routing_function: Optional[Callable] = None,
+            scoring_func: str = "softmax",
+            e_score_correction_bias: Optional[torch.Tensor] = None):
+
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+
+        w1_deq = dequant_block_fp8_weight_naive(layer.w13_weight,
+                                                        layer.w13_weight_scale_inv,
+                                                         self.quant_config.weight_block_size,
+                                                         x.dtype,
+                                                         layer.w13_weight.shape[-2], 
+                                                         layer.w13_weight.shape[-1])
+
+        w2_deq = dequant_block_fp8_weight_naive(layer.w2_weight,
+                                                        layer.w2_weight_scale_inv,
+                                                         self.quant_config.weight_block_size,
+                                                         x.dtype,
+                                                         layer.w2_weight.shape[-2], 
+                                                         layer.w2_weight.shape[-1])
+
+
+        layer.ipex_fusion(
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+        )
+
+
+        B, D = x.shape
+        x = x.view(B, -1, D).repeat(1, top_k, 1).reshape(-1, D)
+        out = torch.zeros(B * top_k, w2_deq.shape[1], dtype=x.dtype, device=x.device)
+        topk_ids = topk_ids.view(-1)
+        for i in range(w1_deq.shape[0]):
+            mask = topk_ids == i
+            if mask.sum():
+                out[mask] = self.act_fn(
+                    x[mask] @ w1_deq[i].transpose(0, 1)) @ w2_deq[i].transpose(0, 1)
+        return (out.view(B, -1, w2_deq.shape[1]) *
+                topk_weights.view(B, -1, 1).to(out.dtype)).sum(dim=1)
+
+
+    def forward_hpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None
+    ):
+        # #assert not use_grouped_topk, 'use_grouped_topk must be False on HPU'
+        # # assert num_expert_group is None, ('num_expert_group is '
+        # #                                   'not supported on HPU')
+        # # assert topk_group is None, 'topk_group is not supported on HPU'
+        # if layer is not None:
+        #     return layer.hpu_fused_moe(x, router_logits, top_k)
+        assert len(x.shape) == 2
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias)
+        final_hidden_states = torch.zeros_like(x)
+        num_experts = layer.w13_weight.shape[0]
+        n_expert_slice = layer.w13_weight.shape[0] // self.moe_n_slice
+        assert n_expert_slice * self.moe_n_slice == num_experts
+
+        # w13_list = layer.hpu_fused_moe.MoeOp.w13_list
+        # w2_list = layer.hpu_fused_moe.MoeOp.w2_list
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import dequant_block_fp8_weight_naive
+
+        orig_M_w13 = layer.orig_M_w13.data
+        orig_N_w13 = layer.orig_N_w13.data
+        orig_M_w2 = layer.orig_M_w2.data
+        orig_N_w2 = layer.orig_N_w2.data
+        w13_weight = dequant_block_fp8_weight_naive(layer.w13_weight,
+                                                    layer.w13_weight_scale_inv,
+                                                    block_size=self.quant_config.weight_block_size,
+                                                    dtype=x.dtype,
+                                                    original_M=orig_M_w13,
+                                                    original_N=orig_N_w13)
+        w2_weight = dequant_block_fp8_weight_naive(layer.w2_weight,
+                                                    layer.w2_weight_scale_inv,
+                                                    block_size=self.quant_config.weight_block_size,
+                                                    dtype=x.dtype,
+                                                    original_M=orig_M_w2,
+                                                    original_N=orig_N_w2)
+        for i in range(self.moe_n_slice):
+            min_expert = i * n_expert_slice
+            max_expert = (i + 1) * n_expert_slice
+
+            w13_list_slice = [w13_weight[j] for j in range(min_expert, max_expert)]
+            w2_list_slice = [w2_weight[j] for j in range(min_expert, max_expert)]
+
+            final_hidden_states += torch.ops.hpu.mixture_of_experts(
+                                            hidden_states=x,
+                                            expert_routing_table=topk_ids.to(torch.int64),
+                                            router_weights=topk_weights.to(x.dtype),
+                                            w12=w13_list_slice,
+                                            w3=w2_list_slice,
+                                            permuted_weights=True,
+                                            activation="silu",
+                                            experts_min=min_expert,
+                                            experts_max=max_expert - 1)
+            htorch.core.mark_step()
+        return final_hidden_states.view(-1, x.shape[1])
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):

@@ -614,7 +614,8 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
 
                 if is_pp_missing_parameter(name, self):
                     continue
-
+                if not name in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -627,6 +628,9 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
                     name = name.replace(weight_name, param_name)
 
                     if is_pp_missing_parameter(name, self):
+                        continue
+                    
+                    if not name in params_dict:
                         continue
 
                     param = params_dict[name]
@@ -643,6 +647,9 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
                         continue
 
                     if is_pp_missing_parameter(name, self):
+                        continue
+                    
+                    if not name in params_dict:
                         continue
 
                     param = params_dict[name]

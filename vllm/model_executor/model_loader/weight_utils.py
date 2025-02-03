@@ -607,13 +607,19 @@ def initialize_dummy_weights(
             generator.manual_seed(seed)
             if torch.finfo(param.data.dtype).bits < 16:
                 # uniform_ doesn't support < 16-bit datatypes (FP8)
-                dtype = param.data.dtype
-                tmp_param = param.data.to(torch.float16)
-                tmp_param = tmp_param.uniform_(low, high,
-                                               generator=generator).to(dtype)
-                param.data.copy_(tmp_param)
+                # dtype = param.data.dtype
+                # tmp_param = param.data.to(torch.float16)
+                # tmp_param = tmp_param.uniform_(low, high,
+                #                                generator=generator).to(dtype)
+                #tmp_param = tmp_param.zero_().to(dtype)
+                # tmp_param = torch.zeros_like(tmp_param).to(dtype)
+                # param.data.copy_(tmp_param)
+                param = torch.zeros_like(param)
             else:
-                param.uniform_(low, high, generator=generator)
+                #param.uniform_(low, high, generator=generator)
+                #param.zero_()
+                param = torch.zeros_like(param)
+                
 
 
 def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:

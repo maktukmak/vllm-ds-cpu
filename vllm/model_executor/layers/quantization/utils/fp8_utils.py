@@ -56,6 +56,33 @@ def input_to_float8(
     x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
+def pad_block_fp8_weight_naive(weight, weight_scale, block_size):
+
+    assert len(block_size) == 2
+
+    block_size_m, block_size_n = block_size
+    weight_scale_m, weight_scale_n = weight_scale.shape[-2:]
+
+    weight, orig_M, orig_N = pad_weight(weight, block_size)
+    M, N = weight.shape[-2:]
+
+    assert weight_scale_m == M // block_size_m
+    assert weight_scale_n == N // block_size_n
+
+    return weight, orig_M, orig_N
+
+def pad_weight(weight, block_size):
+    """Pads a matrix to make its dimensions multiples of block_size."""
+    M, N = weight.shape[-2:]
+    block_size_m, block_size_n = block_size
+    pad_M = (block_size_m - M % block_size_m) % block_size_m
+    pad_N = (block_size_n - N % block_size_n) % block_size_n
+
+    if pad_M == 0 and pad_N == 0:
+        return weight, M, N  # No padding needed
+    padded_weight = torch.nn.functional.pad(weight, (0, pad_N, 0, pad_M), mode='constant', value=0)
+    padded_weight = torch.nn.Parameter(padded_weight, requires_grad=False)
+    return padded_weight, M, N  # Return original dimensions for unpadding
 
 def block_quant_to_tensor_quant(
     x_q_block: torch.Tensor,

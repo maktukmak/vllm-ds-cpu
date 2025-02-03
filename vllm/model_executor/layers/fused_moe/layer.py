@@ -546,8 +546,13 @@ class FusedMoE(torch.nn.Module):
                        custom_routing_function: Optional[Callable] = None,
                        scoring_func: str = "softmax",
                        e_score_correction_bias: Optional[torch.Tensor] = None):
-        from vllm.model_executor.layers.fused_moe.fused_moe import (
-            fused_topk, grouped_topk)
+        
+        if current_platform.is_cpu():
+            from vllm.model_executor.layers.fused_moe.fused_moe_cpu import (
+                fused_topk, grouped_topk)
+        else:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                fused_topk, grouped_topk)
 
         # DeekSeekv2 uses grouped_top_k
         if use_grouped_topk:
