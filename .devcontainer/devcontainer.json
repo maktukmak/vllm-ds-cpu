@@ -1,0 +1,21 @@
+{
+    "build": { "dockerfile": "/home/sdp/vllm-xpu-deepseekr1/Dockerfile.cpu",
+              "args": {
+                      //"https_proxy":"http://proxy-chain.intel.com:912/",
+                      //"http_proxy":"http://proxy-chain.intel.com:912/",
+                       "--net":"host",
+                       "--ipc": "host"} },
+    "runArgs": [
+                //"-e", "https_proxy=http://proxy-chain.intel.com:912/",
+                //"-e", "http_proxy=http://proxy-chain.intel.com:912/", 
+                "-e", "VLLM_SKIP_WARMUP=true"],
+    "customizations": {
+      "vscode": {
+        "settings": {  
+                "extensions.verifySignature": false 
+            },
+        "extensions": ["streetsidesoftware.code-spell-checker", "ms-python.python"]
+      }
+    }
+    //"postStartCommand": "VLLM_TARGET_DEVICE=cpu pip install -e ."
+  }
