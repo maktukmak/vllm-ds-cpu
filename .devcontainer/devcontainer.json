@@ -16,6 +16,10 @@
             },
         "extensions": ["streetsidesoftware.code-spell-checker", "ms-python.python"]
       }
-    }
+    },
+    "containerEnv": {"HF_HOME": "/hf"},
+    "mounts": [
+      "source=/home/sdp/.cache/huggingface,target=/hf,type=bind,consistency=cached"
+    ]
     //"postStartCommand": "VLLM_TARGET_DEVICE=cpu pip install -e ."
   }

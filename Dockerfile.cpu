@@ -43,9 +43,12 @@ COPY requirements-cpu.txt requirements-cpu.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -v -r requirements-cpu.txt
 
-RUN pip install http://mlpc.intel.com/downloads/cpu/ipex-2.6/rc0/intel_extension_for_pytorch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl
-RUN pip install http://mlpc.intel.com/downloads/cpu/ipex-2.6/stock_pt_whls/torch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl
-RUN pip install http://mlpc.intel.com/downloads/cpu/ipex-2.6/stock_pt_whls/torchvision_whls/torchvision-0.21.0+cpu-cp310-cp310-linux_x86_64.whl
+COPY intel_extension_for_pytorch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl intel_extension_for_pytorch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl
+COPY torch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl torch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl
+COPY torchvision-0.21.0+cpu-cp310-cp310-linux_x86_64.whl torchvision-0.21.0+cpu-cp310-cp310-linux_x86_64.whl
+RUN pip install intel_extension_for_pytorch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl
+RUN pip install torch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl
+RUN pip install torchvision-0.21.0+cpu-cp310-cp310-linux_x86_64.whl
 
 COPY . .
 ARG GIT_REPO_CHECK=0
