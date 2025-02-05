@@ -29,7 +29,7 @@ from vllm.model_executor.parameter import (BlockQuantScaleParameter,
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.quantization.utils.fp8_utils_cpu import (
-    dequant_block_fp8_weight_naive)
+    dequant_block_fp8_weight_naive, pad_block_fp8_weight_naive)
 from vllm.model_executor.layers.activation import (SiluAndMul)
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -250,6 +250,16 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            if current_platform.is_cpu():
+                from vllm.model_executor.layers.quantization.utils.fp8_utils_cpu import pad_block_fp8_weight_naive
+                layer.weight, orig_M, orig_N = pad_block_fp8_weight_naive(
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.quant_config.weight_block_size)
+                orig_M = torch.nn.Parameter(torch.tensor(orig_M, dtype=torch.int32), requires_grad=False)
+                orig_N = torch.nn.Parameter(torch.tensor(orig_N, dtype=torch.int32), requires_grad=False)
+                layer.register_parameter("orig_M", orig_M)
+                layer.register_parameter("orig_N", orig_N)
             return
         layer.weight = torch.nn.Parameter(layer.weight.data,
                                           requires_grad=False)
@@ -338,6 +348,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=layer.input_scale,
                 bias=bias,
+                original_M=layer.orig_M,
+                original_N=layer.orig_N,
             )
 
         if self.use_marlin:
@@ -520,6 +532,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            if current_platform.is_cpu():
+                layer.w13_weight, orig_M_w13, orig_N_w13 = pad_block_fp8_weight_naive(
+                    layer.w13_weight,
+                    layer.w13_weight_scale_inv,
+                    self.quant_config.weight_block_size)
+                layer.w2_weight, orig_M_w2, orig_N_w2 = pad_block_fp8_weight_naive(
+                    layer.w2_weight,
+                    layer.w2_weight_scale_inv,
+                    self.quant_config.weight_block_size)
+                orig_M_w13 = torch.nn.Parameter(torch.tensor(orig_M_w13, dtype=torch.int32), requires_grad=False)
+                orig_N_w13 = torch.nn.Parameter(torch.tensor(orig_N_w13, dtype=torch.int32), requires_grad=False)
+                layer.register_parameter("orig_M_w13", orig_M_w13)
+                layer.register_parameter("orig_N_w13", orig_N_w13)
+                orig_M_w2 = torch.nn.Parameter(torch.tensor(orig_M_w2, dtype=torch.int32), requires_grad=False)
+                orig_N_w2 = torch.nn.Parameter(torch.tensor(orig_N_w2, dtype=torch.int32), requires_grad=False)
+                layer.register_parameter("orig_M_w2", orig_M_w2)
+                layer.register_parameter("orig_N_w2", orig_N_w2)
             return
         # If checkpoint is fp16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
@@ -705,14 +734,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
         )
+        orig_M_w13 = layer.orig_M_w13.data
+        orig_N_w13 = layer.orig_N_w13.data
+        orig_M_w2 = layer.orig_M_w2.data
+        orig_N_w2 = layer.orig_N_w2.data
         w1_deq = dequant_block_fp8_weight_naive(layer.w13_weight,
                                                         layer.w13_weight_scale_inv,
                                                          self.quant_config.weight_block_size,
-                                                         x.dtype)
+                                                         x.dtype,
+                                                         original_M=orig_M_w13,
+                                                         original_N=orig_N_w13)
         w2_deq = dequant_block_fp8_weight_naive(layer.w2_weight,
                                                         layer.w2_weight_scale_inv,
                                                          self.quant_config.weight_block_size,
-                                                         x.dtype)
+                                                         x.dtype,
+                                                         original_M=orig_M_w2,
+                                                         original_N=orig_N_w2)
         
         W1 = w1_deq[:,:layer.intermediate_size_per_partition]
         W3 = w1_deq[:, layer.intermediate_size_per_partition: 2 * layer.intermediate_size_per_partition]
